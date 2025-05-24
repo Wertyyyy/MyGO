@@ -6,7 +6,7 @@ vllm_service:
             gpu_memory_utilization: 0.85
             enable_prefix_caching: false
             max_model_len: 8192
-            enforce_eager: true
+            enforce_eager: false
             mm_processor_kwargs:
                 min_pixels: 3136
                 max_pixels: 401408
