@@ -181,6 +181,8 @@ def timer(name: str, rank: Optional[int] = 0, metrics: Optional[Metrics] = None)
     """
     start_time = time.time()
     try:
+        if rank == 0:
+            logger.debug(f"Starting {name}")
         yield
     finally:
         end_time = time.time()
