@@ -65,13 +65,13 @@ main:
             min_pixels: 3136
             max_pixels: 401408
     run_name: "science_qa"
-    model_path: "/aiarena/project/2014-p15/models/Qwen2VL-2B-Instruct"
-    save_dir: "/aiarena/project/2014-p15/models/Qwen2VL-2B-GRPO-science_qa"
+    model_path: /aiarena/project/2014-p15/models/Qwen2VL-2B-Instruct
+    save_dir: /aiarena/project/2014-p15/models/Qwen2VL-2B-GRPO-science_qa
     grpo_beta: 0.04
     lr: 1.0e-6
     total_steps: 1000
     save_steps: 100
-    queue_depth: 2
+    queue_depth: 1
     max_grad_norm: 1.0
     max_length: 1024
     epsilon_low: 0.2

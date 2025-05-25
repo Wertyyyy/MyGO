@@ -2,7 +2,7 @@ vllm_service:
     model_impl: 
         path: implement.model.qwen_vl_vllm
         params:
-            model_name_or_path: /aiarena/project/2014-p15/models/Qwen2-VL-Instruct
+            model_name_or_path: /aiarena/project/2014-p15/models/Qwen2VL-2B-Instruct
             gpu_memory_utilization: 0.85
             enable_prefix_caching: false
             max_model_len: 8192
@@ -21,7 +21,7 @@ tf_service:
     model_impl: 
         path: implement.model.qwen_vl_tf
         params:
-            model_name_or_path: /aiarena/project/2014-p15/models/Qwen2-VL-Instruct
+            model_name_or_path: /aiarena/project/2014-p15/models/Qwen2VL-2B-Instruct
             min_pixels: 3136
             max_pixels: 401408
     token_budget: 20000
@@ -36,7 +36,7 @@ data_service:
     processor_impl:
         path: implement.model.qwen_vl_tf
         params:
-            model_name_or_path: /aiarena/project/2014-p15/models/Qwen2-VL-Instruct
+            model_name_or_path: /aiarena/project/2014-p15/models/Qwen2VL-2B-Instruct
             min_pixels: 3136
             max_pixels: 401408
     reward_impl:
@@ -55,23 +55,23 @@ data_service:
     vllm_host: localhost
     vllm_server_port: 40000
     vllm_nccl_port: 41000
-    tf_host: "10.244.33.31"
+    tf_host: "10.244.175.218"
     tf_port: 42000
 main:
     model_impl:
         path: implement.model.qwen_vl_tf
         params:
-            model_name_or_path: /aiarena/project/2014-p15/models/Qwen2-VL-Instruct
+            model_name_or_path: /aiarena/project/2014-p15/models/Qwen2VL-2B-Instruct
             min_pixels: 3136
             max_pixels: 401408
     run_name: "test"
-    model_path: "/aiarena/project/2014-p15/models/Qwen2-VL-Instruct"
-    save_dir: "/aiarena/project/2014-p15/models/Qwen2-GRPO-test"
+    model_path: /aiarena/project/2014-p15/models/Qwen2VL-2B-Instruct
+    save_dir: /aiarena/project/2014-p15/models/Qwen2VL-2B-GRPO-test
     grpo_beta: 0.04
     lr: 1.0e-6
     total_steps: 1000
     save_steps: 100
-    queue_depth: 2
+    queue_depth: 1
     max_grad_norm: 1.0
     max_length: 1024
     epsilon_low: 0.2

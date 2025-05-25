@@ -53,8 +53,8 @@ main:
         params:
             model_name_or_path: /aiarena/project/2014-p15/models/Qwen2.5-3B-Instruct
     run_name: "test_pure_text"
-    model_path: "/aiarena/project/2014-p15/models/Qwen2.5-3B-Instruct"
-    save_dir: "/aiarena/project/2014-p15/models/Qwen2.5-GRPO-test"
+    model_path: /aiarena/project/2014-p15/models/Qwen2.5-3B-Instruct
+    save_dir: /aiarena/project/2014-p15/models/Qwen2.5-GRPO-test
     grpo_beta: 0.04
     lr: 1.0e-6
     total_steps: 1000
