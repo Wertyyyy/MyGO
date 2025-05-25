@@ -324,7 +324,7 @@ class DataService:
         metrics.add("Data/finish_reason/length", by_length / len(finish_reasons))
 
         # Reward statistics
-        reward_names = [fn.__name__ for fn in self.reward_fns.values()]
+        reward_names = list(self.reward_fns.keys())
 
         logger.debug("Reward Statistics:")
         all_rewards = []
