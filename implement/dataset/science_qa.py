@@ -9,7 +9,18 @@ logger = logging.getLogger(__name__)
 
 class DatasetImpl:
     def __init__(self, dataset_path: str, system_prompt_path: str):
-        self.dataset = load_dataset(dataset_path, split="train")
+        original_dataset = load_dataset(dataset_path, split="train")
+        original_count = len(original_dataset)
+        
+        # Filter dataset to only include examples with images
+        filtered_dataset = original_dataset.filter(lambda example: example.get("image") is not None)
+        filtered_count = len(filtered_dataset)
+        
+        logger.info(f"Before filtering: {original_count}")
+        logger.info(f"After filtering: {filtered_count}")
+        logger.info(f"Filtered out: {original_count - filtered_count}")
+        
+        self.dataset = filtered_dataset
         with open(system_prompt_path, "r") as f:
             self.system_prompt = f.read()
 
