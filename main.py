@@ -225,13 +225,12 @@ def main():
                     metrics.add("Train/loss", loss.item())
                     metrics.add("Train/kl", average_kl.item())
 
-            # NOTE: Temporarily disabled grad clip due to busy network
-            # with timer("grad_clip", accelerator.process_index, metrics):
-            #     grad_norm = torch.nn.utils.clip_grad_norm_(
-            #         policy.model.parameters(),
-            #         max_norm=main_config["max_grad_norm"],
-            #     )
-            #     metrics.add("Train/grad_norm", grad_norm.item())
+            with timer("grad_clip", accelerator.process_index, metrics):
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    policy.model.parameters(),
+                    max_norm=main_config["max_grad_norm"],
+                )
+                metrics.add("Train/grad_norm", grad_norm.item())
 
             accelerator.wait_for_everyone()
             with timer("optimizer_step", accelerator.process_index, metrics):
