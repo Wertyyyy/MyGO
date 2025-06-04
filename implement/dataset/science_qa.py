@@ -1,7 +1,7 @@
 import logging
 from datasets import load_dataset
 
-from data_service.typing.messages import encode_image_to_base64
+from data_service.typing.message import encode_image_to_base64
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

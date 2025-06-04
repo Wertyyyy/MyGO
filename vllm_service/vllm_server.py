@@ -1,25 +1,26 @@
-import os
-
-os.environ["VLLM_USE_V1"] = "0"
-
-from typing import List, Any
+from typing import List, Dict
 import logging
 import time
 import fire
 import asyncio
-import yaml
-import importlib
+import importlib.util
+import os
+import uuid
+import traceback
+
 import torch
 from fastapi import FastAPI
 from pydantic import BaseModel
 import uvicorn
+
+from data_service.typing.message import Conversation
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
 class GenerateRequest(BaseModel):
-    conversation: List[dict]
+    conversation: Conversation
     n: int
     temperature: float
     max_tokens: int
@@ -39,7 +40,7 @@ class UpdateWeightsNCCLRequest(BaseModel):
 class VLLMServer:
     def __init__(
         self,
-        model_impl: dict[str, Any],
+        llm_params: Dict,
         host: str,
         nccl_port: int,
     ):
@@ -47,17 +48,46 @@ class VLLMServer:
         self.nccl_port = nccl_port
         self.pynccl = None
 
-        logger.info(f"Importing model implementation: {model_impl}")
-        model_module = importlib.import_module(model_impl["path"])
-        self.model_impl = model_module.VLLMModelImpl(**model_impl["params"])
+        from vllm import AsyncLLMEngine, AsyncEngineArgs
+
+        self.engine = AsyncLLMEngine.from_engine_args(
+            AsyncEngineArgs(**llm_params)
+        )
+        logger.info("VLLM engine loaded successfully")
 
     async def generate(self, request: GenerateRequest) -> dict:
-        return await self.model_impl.generate(
-            conversation=request.conversation,
+        from vllm import SamplingParams
+
+        sampling_params = SamplingParams(
             n=request.n,
             temperature=request.temperature,
             max_tokens=request.max_tokens,
         )
+        request_id = str(uuid.uuid4().hex)
+
+        tokenizer = await self.engine.get_tokenizer()
+        prompt_text = tokenizer.apply_chat_template(
+            request.conversation, tokenize=False, add_generation_prompt=True
+        )
+        prompt_data = {"prompt": prompt_text}
+        prompt_images = request.conversation.get_images()
+        if prompt_images:
+            prompt_data["multi_modal_data"] = {"image": prompt_images}
+
+        results_generator = self.engine.generate(
+            prompt=prompt_data,
+            sampling_params=sampling_params,
+            request_id=request_id,
+        )
+
+        final_output = None
+        async for request_output in results_generator:
+            final_output = request_output
+
+        return {
+            "completions": [output.text for output in final_output.outputs],
+            "finish_reasons": [output.finish_reason for output in final_output.outputs],
+        }
 
     def _init_nccl_blocking(self):
         from vllm.distributed.utils import StatelessProcessGroup
@@ -84,16 +114,26 @@ class VLLMServer:
         logging.info("Thread: Updating weights via NCCL start")
         start_time = time.time()
 
+        # Safe dtype mapping
+        dtype_mapping = {
+            "torch.float16": torch.float16,
+            "torch.float32": torch.float32,
+            "torch.bfloat16": torch.bfloat16,
+            "torch.int32": torch.int32,
+            "torch.int64": torch.int64,
+        }
+
         for name, shape, dtype in zip(names, shapes, dtypes):
             logger.debug(
                 f"Updating weight: {name} with shape: {shape} and dtype: {dtype}"
             )
+            torch_dtype = dtype_mapping[dtype]
             weight = torch.empty(
-                shape, dtype=eval(dtype), device=torch.device("cuda:0")
+                shape, dtype=torch_dtype, device=torch.device("cuda:0")
             )
             self.pynccl.broadcast(weight, src=0, stream=torch.cuda.current_stream())
             self.pynccl.group.barrier()
-            self.model_impl.engine.engine.model_executor.driver_worker.model_runner.model.load_weights(
+            self.engine.engine.model_executor.driver_worker.model_runner.model.load_weights(
                 weights=[(name, weight)]
             )
             del weight
@@ -123,11 +163,12 @@ def create_app(server: VLLMServer):
         try:
             return await server.generate(request)
         except Exception as e:
-            logger.error(f"Error during generation: {str(e)}", exc_info=True)
-            return {
-                "completions": [f"Error: {str(e)}"],
-                "finish_reasons": ["error"],
-            }
+            tb_str = traceback.format_exc()
+            logger.error(f"Error during generation: {str(e)}\nTraceback:\n{tb_str}")
+            return GenerateResponse(
+                completions=[f"Error: {str(e)}"],
+                finish_reasons=["error"],
+            )
 
     @app.post("/init_nccl/")
     async def init_nccl():
@@ -143,39 +184,38 @@ def create_app(server: VLLMServer):
 
 
 def main(config_path: str):
-    with open(config_path, "r") as f:
-        server_config = yaml.safe_load(f)["vllm_service"]
+    # Load the Python config module
+    spec = importlib.util.spec_from_file_location("config_module", config_path)
+    config_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config_module)
 
-    gpu_id = server_config["gpu_id"]
-    if gpu_id is not None:
-        if gpu_id >= 0:
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-            logging.info(f"Using GPU {gpu_id}")
-        elif gpu_id < 0 and gpu_id >= -torch.cuda.device_count():
-            total_gpu_nums = torch.cuda.device_count()
-            logging.info(f"Total GPUs: {total_gpu_nums}")
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id + total_gpu_nums)
-            logging.info(f"Using GPU {gpu_id + total_gpu_nums}")
-        else:
-            raise ValueError(f"Invalid GPU ID: {gpu_id}")
+    vllm_config = config_module.vllm_server
+
+    # Handle GPU configuration
+    gpu_id = vllm_config["gpu_id"]
+    if gpu_id >= 0:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        logging.info(f"Using GPU {gpu_id}")
+    elif gpu_id < 0 and gpu_id >= -torch.cuda.device_count():
+        total_gpu_nums = torch.cuda.device_count()
+        logging.info(f"Total GPUs: {total_gpu_nums}")
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id + total_gpu_nums)
+        logging.info(f"Using GPU {gpu_id + total_gpu_nums}")
     else:
-        if "CUDA_VISIBLE_DEVICES" not in os.environ:
-            device_count = torch.cuda.device_count()
-            if device_count > 0:
-                os.environ["CUDA_VISIBLE_DEVICES"] = str(device_count - 1)
-                logging.info(f"Using GPU {device_count - 1}")
+        raise ValueError(f"Invalid GPU ID: {gpu_id}")
 
+    # Create server with configuration from vllm_server
     server = VLLMServer(
-        model_impl=server_config["model_impl"],
-        host=server_config["host"],
-        nccl_port=server_config["nccl_port"],
+        llm_params=vllm_config["llm_params"],
+        host=vllm_config["host"],
+        nccl_port=vllm_config["nccl_port"],
     )
 
     app = create_app(server)
     config = uvicorn.Config(
         app,
-        host=server_config["host"],
-        port=server_config["server_port"],
+        host=vllm_config["host"],
+        port=vllm_config["port"],
         timeout_keep_alive=7200,
     )
     server_instance = uvicorn.Server(config)

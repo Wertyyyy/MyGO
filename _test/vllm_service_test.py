@@ -1,73 +1,33 @@
 import asyncio
 import time
 import logging
-import yaml
+import importlib.util
+import importlib
 import fire
 import torch
 
 from vllm_service.vllm_client import VLLMClient
-from data_service.typing.messages import encode_image_to_base64
+from _test.test_data.convs import TEST_CONVERSATIONS_MULTIMODAL, TEST_CONVERSATIONS_PURE_TEXT
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TEST_CONVERSATIONS = {
-    "image_text": [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "image": "data:image/jpg;base64,"
-                    + encode_image_to_base64("test/images/demo_1.jpg"),
-                },
-                {"type": "text", "text": "Describe this image in detail."},
-            ],
-        },
-    ],
-    "image_only": [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "image": "data:image/jpg;base64,"
-                    + encode_image_to_base64("test/images/demo_2.jpg"),
-                },
-            ],
-        },
-    ],
-    "text_only": [
-        {
-            "role": "user",
-            "content": "Hello, how are you? Please respond briefly.",
-        },
-    ],
-    "multi_image": [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "image": "data:image/jpg;base64,"
-                    + encode_image_to_base64("test/images/demo_1.jpg"),
-                },
-                {
-                    "type": "image",
-                    "image": "data:image/jpg;base64,"
-                    + encode_image_to_base64("test/images/demo_2.jpg"),
-                },
-                {"type": "text", "text": "Compare these two images."},
-            ],
-        },
-    ],
-}
+
+def check_multimodal_support(config_module):
+    """Check if the model implementation supports multimodal"""
+    try:
+        tf_config = config_module.tf_server
+        impl_module = importlib.import_module(tf_config["impl_path"])
+        return impl_module.TFModelImpl.multimodal
+    except Exception as e:
+        logger.warning(f"Could not check multimodal support: {e}")
+        return False
 
 
-async def test_basic_inference(client: VLLMClient):
+async def test_basic_inference(client: VLLMClient, test_conversations):
     logger.info("Testing basic inference...")
 
-    for test_name, conversation in TEST_CONVERSATIONS.items():
+    for test_name, conversation in test_conversations.items():
         logger.info(f"Testing {test_name}")
 
         try:
@@ -87,10 +47,14 @@ async def test_basic_inference(client: VLLMClient):
             logger.error(f"  Testing {test_name} failed: {str(e)}")
 
 
-async def test_multiple_generation(client: VLLMClient):
+async def test_multiple_generation(client: VLLMClient, test_conversations):
     logger.info("Testing multiple generation...")
 
-    conversation = TEST_CONVERSATIONS["image_text"]
+    # Choose the first available conversation for multiple generation test
+    conversation_name = list(test_conversations.keys())[0]
+    conversation = test_conversations[conversation_name]
+    
+    logger.info(f"Using conversation '{conversation_name}' for multiple generation test")
 
     try:
         start_time = time.time()
@@ -131,21 +95,13 @@ async def test_nccl_initialization(client: VLLMClient):
         raise
 
 
-async def test_weight_update(client: VLLMClient, config: dict):
+async def test_weight_update(client: VLLMClient, config_module):
     logger.info("Testing multiple weight updates...")
 
-    model_path = config["vllm_service"]["model_impl"]["params"]["model_name_or_path"]
-
     try:
-        from transformers import Qwen2VLForConditionalGeneration
-
-        logger.info("Loading full model weights for multiple updates...")
-        model = Qwen2VLForConditionalGeneration.from_pretrained(
-            model_path,
-            torch_dtype=torch.float16,
-            device_map={"": "cuda:0"},
-            low_cpu_mem_usage=True,
-        )
+        tf_config = config_module.tf_server
+        impl_module = importlib.import_module(tf_config["impl_path"])
+        model = impl_module.TFModelImpl(**tf_config["model_params"]).model
 
         state_dict = model.state_dict()
         total_size_mb = sum(
@@ -208,13 +164,27 @@ async def test_weight_update(client: VLLMClient, config: dict):
 async def test_vllm_service(config_path: str):
     logger.info("Starting VLLM Service tests")
 
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
+    # Load the Python config module
+    spec = importlib.util.spec_from_file_location("config_module", config_path)
+    config_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config_module)
 
-    vllm_config = config["vllm_service"]
-    host = vllm_config.get("host", "localhost")
-    server_port = vllm_config.get("server_port", 40000)
-    nccl_port = vllm_config.get("nccl_port", 41000)
+    # Check multimodal support
+    is_multimodal = check_multimodal_support(config_module)
+    logger.info(f"Model multimodal support: {is_multimodal}")
+    
+    # Select appropriate test conversations
+    if is_multimodal:
+        test_conversations = TEST_CONVERSATIONS_MULTIMODAL
+        logger.info(f"Using multimodal test conversations ({len(test_conversations)} cases)")
+    else:
+        test_conversations = TEST_CONVERSATIONS_PURE_TEXT
+        logger.info(f"Using text-only test conversations ({len(test_conversations)} cases)")
+
+    vllm_config = config_module.vllm_server
+    host = vllm_config["host"]
+    server_port = vllm_config["port"]
+    nccl_port = vllm_config["nccl_port"]
 
     logger.info(f"Connecting to VLLM service at {host}:{server_port}")
 
@@ -228,10 +198,12 @@ async def test_vllm_service(config_path: str):
         await client.initialize()
         logger.info("Connected to VLLM service successfully!")
 
-        await test_basic_inference(client)
-        await test_multiple_generation(client)
+        await test_basic_inference(client, test_conversations)
+        await test_multiple_generation(client, test_conversations)
         await test_nccl_initialization(client)
-        await test_weight_update(client, config)
+        await test_weight_update(client, config_module)
+
+        logger.info("VLLM Service tests completed successfully")
 
     except Exception as e:
         logger.error(f"VLLM Service tests failed: {str(e)}")
