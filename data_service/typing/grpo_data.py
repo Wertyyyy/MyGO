@@ -21,16 +21,17 @@ class GRPOData(BaseModel):
     solution: str = Field(...)
     stop_reason: str = Field(...)
 
-    length: int = Field(...)
-    resp_token_ids: List[int] = Field(...)
+    response_token_ids: List[int] = Field(...)
+    prompt_token_ids: List[int] = Field(...)
+
     ref_logprobs: Optional[torch.Tensor] = Field(None)
     pol_logprobs: Optional[torch.Tensor] = Field(None)
     per_token_entropy: Optional[torch.Tensor] = Field(None)
     per_token_kl: Optional[torch.Tensor] = Field(None)
     per_token_loss: Optional[torch.Tensor] = Field(None)
 
-    group_resp_token_sum: int = Field(...)
-    group_seq_num: int = Field(...)
+    group_resp_token_sum: Optional[int] = Field(None)
+    group_seq_num: Optional[int] = Field(None)
     global_resp_token_sum: Optional[int] = Field(None)
     global_seq_num: Optional[int] = Field(None)
     global_group_num: Optional[int] = Field(None)
@@ -82,12 +83,16 @@ class GRPOData(BaseModel):
         return value
 
     @property
-    def response_length(self):
-        return len(self.resp_token_ids)
+    def length(self) -> int:
+        return len(self.response_token_ids) + len(self.prompt_token_ids)
 
     @property
-    def prompt_length(self):
-        return self.length - self.response_length
+    def response_length(self) -> int:
+        return len(self.response_token_ids)
+
+    @property
+    def prompt_length(self) -> int:
+        return len(self.prompt_token_ids)
 
     @property
     def reward_sum(self) -> float:
@@ -172,6 +177,7 @@ class BatchedGRPOData(BaseModel):
 
     def get_data_fields(self, field_name: str, device=None) -> List:
         if device is None:
+            # FIXME: This is a hack to get the device of the current process
             from accelerate import PartialState
 
             state = PartialState()

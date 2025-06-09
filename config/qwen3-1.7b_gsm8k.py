@@ -1,8 +1,8 @@
 from config.utils import get_path
 
 _model_impl = "implement.model.qwen"
-_model_name = "Qwen2.5-1.5B-Instruct"
-_run_name = "test_expend_segment"
+_model_name = "Qwen3-1.7B-Instruct"
+_run_name = "test_fsdp2"
 
 model = {
     "impl_path": _model_impl,
@@ -48,29 +48,24 @@ tf_server = {
 }
 
 vllm_server = {
-    "devices": ["cuda:7"],
+    "device": "cuda:7",
     "llm_params": {
         "model": get_path("model", _model_name),
         "dtype": "bfloat16",
         "tensor_parallel_size": 1,
-        "data_parallel_size": 1,
-        "gpu_memory_utilization": 0.9,
-        "max_model_len": 2048,
-        "enforce_eager": False,
+        "gpu_memory_utilization": 0.85,
         "enable_prefix_caching": False,
-        "disable_log_requests": True,
+        "max_model_len": 8192,
+        "enforce_eager": False,
     },
 }
 
 data_server = {
     "temperature": 1.0,
-    "pregenerate_steps": 3,
+    "pregenerate_steps": 1,
     "use_ref": "auto",
     "global_batch_size": 16,
     "per_prompt_generation_count": 8,
-    "token_budget": 9000,
-    "max_micro_step_num": 2,
-    "gpu_num": 7,
 }
 
 length = {
@@ -88,5 +83,7 @@ training = {
     "project_name": "MyGO",
     "run_name": _run_name,
     "max_grad_norm": 1.0,
+    "token_budget": 9000,
+    "max_micro_step_num": 2,
     "loss_type": "global",
 }

@@ -1,12 +1,12 @@
 import logging
 import time
 import asyncio
-from typing import List, Any, Dict
+from typing import List
 import contextlib
 import importlib.util
 import copy
-from dataclasses import dataclass
 import traceback
+from functools import partial
 
 import torch
 import fire
@@ -16,8 +16,10 @@ from pydantic import BaseModel
 
 from vllm_service.vllm_client import VLLMClient
 from tf_service.tf_client import TFClient
-from data_service.typing.grpo_data import GRPOData
+from data_service.typing.grpo_data import GRPOData, BatchedGRPOData
 from data_service.typing.message import Conversation
+from data_service.grouping import adaptive_grouping
+from config.utils import ConfigManager
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -29,88 +31,84 @@ class StepUpdateRequest(BaseModel):
 
 class DataRequest(BaseModel):
     step: int
+    rank: int
+    update_step: bool
 
 
 class DataResponse(BaseModel):
-    data: List[List[GRPOData]]
-
-
-@dataclass
-class GenerationConfig:
-    global_batch_size: int
-    per_prompt_generation_count: int
-    max_response_length: int
-    max_prompt_length: int
-    temperature: float
-    pregenerate_steps: int
-
-
-@dataclass
-class NetworkConfig:
-    vllm_host: str
-    vllm_port: int
-    tf_host: str
-    tf_port: int
+    data: List[BatchedGRPOData]
 
 
 class DataServer:
     def __init__(
         self,
-        dataset_impl: Dict[str, Any],
-        processor_impl: Dict[str, Any],
-        reward_impl: Dict[str, Any],
-        generation_config: GenerationConfig,
-        network_config: NetworkConfig,
+        config: ConfigManager,
     ):
-        self.dataset_impl = dataset_impl
-        self.processor_impl = processor_impl
-        self.reward_impl = reward_impl
-        self.generation_config = generation_config
-        self.network_config = network_config
+        self.config = config
+        if self.config.data_server.use_ref == "auto":
+            self.use_ref = self.config.training.grpo_beta > 0
+        elif self.config.data_server.use_ref == "always":
+            self.use_ref = True
+        elif self.config.data_server.use_ref == "never":
+            self.use_ref = False
+        else:
+            raise ValueError(
+                f"Invalid use_ref value: {self.config.data_server.use_ref}"
+            )
+
+        logger.info(f"Using reference model: {self.use_ref}")
 
         self.current_step = 0
-        self.pregenerate_steps = self.generation_config.pregenerate_steps
+        self.pregenerate_steps = self.config.data_server.pregenerate_steps
         self.fetching_tasks = {}
 
         self._initialize_components()
 
     def _initialize_components(self):
-        """Initialize dataset, processor, and reward functions"""
         # Load dataset
-        dataset_module = importlib.import_module(self.dataset_impl["path"])
-        self.dataset = dataset_module.DatasetImpl(**self.dataset_impl["params"])
-        logger.info(f"Loaded dataset implementation: {self.dataset_impl['path']}")
+        dataset_module = importlib.import_module(self.config.dataset.train_impl_path)
+        self.dataset = dataset_module.TrainingDatasetImpl(
+            dataset_path=self.config.dataset.train_dataset_path,
+            system_prompt_path=self.config.dataset.system_prompt_path,
+            template_path=self.config.dataset.template_path,
+        )
+        logger.info(
+            f"Loaded dataset implementation: {self.config.dataset.train_impl_path}"
+        )
 
         # Load processor
-        processor_module = importlib.import_module(self.processor_impl["path"])
+        processor_module = importlib.import_module(self.config.processor.impl_path)
         self.processor = processor_module.TFProcessorImpl(
-            **self.processor_impl["params"]
+            init_params=self.config.processor.init_params.to_dict()
         )
-        logger.info(f"Loaded processor implementation: {self.processor_impl['path']}")
+        logger.info(
+            f"Loaded processor implementation: {self.config.processor.impl_path}"
+        )
 
         # Load reward functions
         self.reward_fns = {}
-        for reward_name, reward_spec in self.reward_impl.items():
-            reward_module = importlib.import_module(reward_spec["path"])
+        for reward_name, reward_path in self.config.reward.to_dict().items():
+            reward_module = importlib.import_module(reward_path)
             self.reward_fns[reward_name] = reward_module.reward
-            logger.info(
-                f"Loaded reward function: {reward_name} from {reward_spec['path']}"
-            )
+            logger.info(f"Loaded reward function: {reward_name} from {reward_path}")
 
         self._filter_dataset()
         self._create_dataloader()
 
     def _filter_dataset(self):
-        def filter_fn(example):
-            conversations, _ = self.dataset.collate_fn([example])
+        def filter_fn(example, collate_fn):
+            conversations, _ = collate_fn([example])
             seq_len = self.processor.get_seq_length(conversations[0])
-            return seq_len <= self.generation_config.max_prompt_length
+            return seq_len <= self.config.length.max_prompt_length
 
         original_size = len(self.dataset.dataset)
-        logger.info(f"Dataset size before filtering: {original_size}")
-        self.dataset.dataset = self.dataset.dataset.filter(filter_fn, batched=False)
+        logger.info(f"Training dataset size before filtering: {original_size}")
+        self.dataset.dataset = self.dataset.dataset.filter(
+            partial(filter_fn, collate_fn=self.dataset.collate_fn),
+            batched=False,
+        )
         filtered_size = len(self.dataset.dataset)
-        logger.info(f"Dataset size after filtering: {filtered_size}")
+        logger.info(f"Training dataset size after filtering: {filtered_size}")
 
     def _create_dataloader(self):
         def collate_wrapper(examples):
@@ -118,30 +116,29 @@ class DataServer:
 
         dataloader = torch.utils.data.DataLoader(
             self.dataset.dataset,
-            batch_size=self.generation_config.global_batch_size,
+            batch_size=self.config.data_server.global_batch_size,
             shuffle=True,
             collate_fn=collate_wrapper,
             drop_last=True,
         )
         self.dataloader = iter(dataloader)
         logger.info(
-            f"DataLoader created with batch size: {self.generation_config.global_batch_size}"
+            f"DataLoader created with batch size: {self.config.data_server.global_batch_size}"
         )
 
     async def initialize_clients(self):
-        """Initialize VLLM and TF clients"""
         self.policy_model_vllm_client = VLLMClient(
-            host=self.network_config.vllm_host,
-            server_port=self.network_config.vllm_port,
+            host=self.config.network.vllm_host,
+            server_port=self.config.network.vllm_port,
         )
-        self.ref_model_tf_client = TFClient(
-            host=self.network_config.tf_host, port=self.network_config.tf_port
-        )
-
-        clients_to_init = [
-            self.policy_model_vllm_client.initialize(),
-            self.ref_model_tf_client.initialize(),
-        ]
+        clients_to_init = [self.policy_model_vllm_client.initialize()]
+        if self.use_ref:
+            self.ref_model_tf_client = TFClient(
+                host=self.config.network.tf_host, port=self.config.network.tf_port
+            )
+            clients_to_init.append(self.ref_model_tf_client.initialize())
+        else:
+            self.ref_model_tf_client = None
 
         await asyncio.gather(*clients_to_init)
         logger.info("Data service clients initialized")
@@ -188,42 +185,84 @@ class DataServer:
     ) -> List[GRPOData]:
         vllm_outputs = await self.policy_model_vllm_client.generate(
             conversation=conversation,
-            n=self.generation_config.per_prompt_generation_count,
-            max_tokens=self.generation_config.max_response_length,
-            temperature=self.generation_config.temperature,
+            n=self.config.data_server.per_prompt_generation_count,
+            max_tokens=self.config.length.max_response_length,
+            temperature=self.config.data_server.temperature,
         )
 
         conversations: List[Conversation] = []
-        seq_lengths = []
+        batched_prompt_token_ids = []
+        batched_response_token_ids = []
         for rollout in vllm_outputs["completions"]:
             conversation_ = copy.deepcopy(conversation)
             conversation_.add_message(role="assistant", content=rollout)
             conversations.append(conversation_)
-            seq_lengths.append(self.processor.get_seq_length(conversation_))
 
-        tf_results = await self.ref_model_tf_client.get_logprobs_and_input_ids(
-            conversations
+            seq_length = self.processor.get_seq_length(conversation_)
+            prompt_token_ids, response_token_ids = (
+                self.processor.get_prompt_response_token_ids(conversation_)
+            )
+            assert prompt_token_ids == vllm_outputs["prompt_token_ids"]
+            assert len(prompt_token_ids) + len(response_token_ids) == seq_length
+
+            assert len(prompt_token_ids) <= self.config.length.max_prompt_length
+            # However, the prompt and response token ids may be slightly longer than the max length
+            # Hopefully this will never happen
+            if (
+                len(prompt_token_ids) + len(response_token_ids)
+                > self.config.length.max_length
+            ):
+                response_token_ids = response_token_ids[
+                    : self.config.length.max_length - len(prompt_token_ids)
+                ]
+                logger.warning(
+                    f"Token ids are longer than the max length, truncating to {len(response_token_ids)}\n"
+                    f"Conversation: {conversation_}\n"
+                    f"Prompt token ids: {prompt_token_ids}\n"
+                    f"Response token ids (before truncation): {self.processor.get_prompt_response_token_ids(conversation_)[1]}\n"
+                    f"Response token ids (after truncation): {response_token_ids}"
+                )
+
+            batched_prompt_token_ids.append(prompt_token_ids)
+            batched_response_token_ids.append(response_token_ids)
+
+        # Only get logprobs if using reference model
+        if self.use_ref:
+            tf_results = await self.ref_model_tf_client.get_logprobs_and_input_ids(
+                conversations
+            )
+            batched_ref_logprobs = tf_results["batched_logprobs"]
+        else:
+            # Create dummy logprobs and input_ids if not using ref model
+            batched_ref_logprobs = [None for _ in conversations]
+
+        group_resp_token_sum = sum(
+            len(resp_ids) for resp_ids in batched_response_token_ids
         )
-        batched_ref_logprobs = tf_results["batched_logprobs"]
-        batched_input_ids = tf_results["batched_input_ids"]
-        group_resp_token_sum = sum(len(logprobs) for logprobs in batched_ref_logprobs)
 
         grpo_data_list: List[GRPOData] = []
         for response_idx, (
             conversation,
-            length,
             stop_reason,
             ref_logprobs,
-            input_ids,
+            prompt_token_ids,
+            response_token_ids,
         ) in enumerate(
             zip(
                 conversations,
-                seq_lengths,
                 vllm_outputs["finish_reasons"],
                 batched_ref_logprobs,
-                batched_input_ids,
+                batched_prompt_token_ids,
+                batched_response_token_ids,
             )
         ):
+            if ref_logprobs is not None and len(ref_logprobs) != len(
+                response_token_ids
+            ):
+                logger.warning(
+                    f"ref_logprobs length {len(ref_logprobs)} != response_token_ids length {len(response_token_ids)}"
+                )
+
             grpo_data_list.append(
                 GRPOData(
                     prompt_idx=prompt_idx,
@@ -231,8 +270,8 @@ class DataServer:
                     conversation=conversation,
                     solution=solution,
                     stop_reason=stop_reason,
-                    length=length,
-                    resp_token_ids=input_ids,
+                    prompt_token_ids=prompt_token_ids,
+                    response_token_ids=response_token_ids,
                     ref_logprobs=ref_logprobs,
                     group_resp_token_sum=group_resp_token_sum,
                     group_seq_num=len(conversations),
@@ -270,10 +309,16 @@ class DataServer:
                 data.global_group_num = global_group_num
                 data.global_resp_max_len = global_resp_max_len
 
+        all_data = adaptive_grouping(
+            all_data,
+            gpu_num=self.config.data_server.gpu_num,
+            token_budget=self.config.data_server.token_budget,
+            max_micro_step_num=self.config.data_server.max_micro_step_num,
+        )
+
         return all_data
 
     async def update_step(self, step: int):
-        """Update current step and pregenerate data for future steps"""
         logger.info(f"Updating step from {self.current_step} to {step}")
         self.current_step = step
 
@@ -289,11 +334,14 @@ class DataServer:
 
         logger.info(f"Step update completed. Current step: {self.current_step}")
 
-    async def get_data(self, step: int) -> List[List[GRPOData]]:
-        """Get data for a specific step"""
+    async def get_data(self, step: int, rank: int) -> List[BatchedGRPOData]:
         if step not in self.fetching_tasks:
             raise HTTPException(status_code=404, detail="Data not found")
-        return await self.fetching_tasks[step]
+        global_step_data = await self.fetching_tasks[step]
+        rank_data = []
+        for micro_step_data in global_step_data.data:
+            rank_data.append(micro_step_data.data[rank])
+        return rank_data
 
     async def close(self):
         if self.policy_model_vllm_client:
@@ -302,7 +350,6 @@ class DataServer:
             await self.ref_model_tf_client.close()
 
     async def reset(self):
-        """Reset the server state to initial conditions"""
         logger.info("Resetting data server state")
 
         # Cancel all pending fetching tasks
@@ -319,6 +366,7 @@ class DataServer:
 
         # Recreate dataloader to get fresh data
         self._create_dataloader()
+        await self.update_step(0)
 
         logger.info("Data server state reset completed")
 
@@ -385,8 +433,10 @@ def create_app(server: DataServer):
         """Fetch training data for specific step"""
         try:
             start_time = time.time()
+            if request.update_step:
+                await server.update_step(request.step)
 
-            data = await server.get_data(request.step)
+            data = await server.get_data(request.step, request.rank)
 
             end_time = time.time()
             logger.info(
@@ -407,55 +457,17 @@ def create_app(server: DataServer):
 
 
 def main(config_file: str):
-    # Load the Python config module
-    spec = importlib.util.spec_from_file_location("config_module", config_file)
-    config_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(config_module)
-
-    # Extract data_server configuration
-    data_config = config_module.data_server
-    processor_config = config_module.processor
-
-    # Create configuration objects from nested config
-    generation_config = GenerationConfig(**data_config["generation_config"])
-    network_config = NetworkConfig(**data_config["network_config"])
-
-    # Prepare dataset implementation config
-    dataset_impl = {
-        "path": data_config["dataset"]["impl_path"],
-        "params": data_config["dataset"]["params"],
-    }
-
-    # Prepare processor implementation config
-    processor_impl = {
-        "path": processor_config["impl_path"],
-        "params": processor_config["params"],
-    }
-
-    # Prepare reward implementation config
-    reward_impl = {}
-    for reward_name, reward_path in data_config["reward"].items():
-        reward_impl[reward_name] = {"path": reward_path}
-
-    server = DataServer(
-        dataset_impl=dataset_impl,
-        processor_impl=processor_impl,
-        reward_impl=reward_impl,
-        generation_config=generation_config,
-        network_config=network_config,
-    )
-
+    config = ConfigManager(config_file)
+    server = DataServer(config=config)
     app = create_app(server)
 
-    config_obj = uvicorn.Config(
+    uvicorn_config = uvicorn.Config(
         app,
-        host=data_config["host"],
-        port=data_config["port"],
+        host="0.0.0.0",
+        port=config.network.data_port,
         timeout_keep_alive=7200,
-        log_level="debug",
-        access_log=True,
     )
-    server_instance = uvicorn.Server(config_obj)
+    server_instance = uvicorn.Server(uvicorn_config)
     asyncio.run(server_instance.serve())
 
 

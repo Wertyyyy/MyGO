@@ -1,4 +1,3 @@
-from typing import List, Tuple
 import logging
 import os
 import sys
@@ -8,203 +7,181 @@ import torch
 import torch.optim as optim
 
 from accelerate import Accelerator, InitProcessGroupKwargs
-from accelerate.utils import broadcast_object_list
-from torch.distributed.checkpoint.state_dict import (
-    get_model_state_dict,
-    StateDictOptions,
-)
-import wandb
-import swanlab
-
-from vllm_service.vllm_client import VLLMClient
-from data_service.grouping import adaptive_grouping
-from data_service.typing.grpo_data import save_grpo_data_to_json
+from vllm_service.nccl_client import NCCLClient
 from data_service.data_client import DataClient
 from utils.metrics import MetricsManager
 from utils.decorators import (
     track_time,
     track_metrics,
+    track_memory,
     on_main_process,
-    per_certain_step,
+    per_step,
     clear_and_log_metrics,
     catch_exception,
 )
-from config.utils import load_config
+from config.utils import ConfigManager
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
 class Trainer:
-    def __init__(self, config_file: str):
-        self.config = load_config(config_file)
+    def __init__(self, config: ConfigManager):
+        self.config = config
         self.accelerator = Accelerator(
             kwargs_handlers=[InitProcessGroupKwargs(backend="cuda:nccl,cpu:gloo")]
         )
         self.metrics = MetricsManager(accelerator=self.accelerator)
-        self._setup_model_and_optimizer()
+        self.data_client = DataClient(
+            host="localhost", port=self.config.network.data_port
+        )
+        self.data_client.initialize()
+
         self._setup_clients()
+        self._setup_model_and_optimizer()
         self.global_step = 0
 
     def _setup_model_and_optimizer(self):
-        model_module = importlib.import_module(self.config.model["impl_path"])
-        self.policy = model_module.TFModelImpl(**self.config.model["params"])
+        model_module = importlib.import_module(self.config.model.impl_path)
+        init_params = self.config.model.init_params.to_dict()
+        init_params["device_map"] = self.accelerator.device
+        self.policy = model_module.TFModelImpl(init_params=init_params)
 
-        processor_module = importlib.import_module(self.config.processor["impl_path"])
+        processor_module = importlib.import_module(self.config.processor.impl_path)
         self.processor = processor_module.TFProcessorImpl(
-            **self.config.processor["params"]
+            init_params=self.config.processor.init_params.to_dict()
         )
 
         self.optimizer = optim.AdamW(
-            self.policy.model.parameters(), lr=self.config.training["lr"]
+            self.policy.model.parameters(), lr=self.config.training.lr
         )
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer,
-            T_max=self.config.training["total_steps"] * self.accelerator.num_processes,
-            eta_min=self.config.training["lr"] * 0.1,
+            T_max=self.config.training.total_steps * self.accelerator.num_processes,
+            eta_min=self.config.training.lr * 0.1,
         )
 
         self.policy.model, self.optimizer, self.scheduler = self.accelerator.prepare(
             self.policy.model, self.optimizer, self.scheduler
         )
+        self.policy.model.set_reshard_after_backward(False)
 
     @on_main_process
     def _setup_clients(self):
-        self.data_client = DataClient(
-            host="localhost", port=self.config.data_server["port"]
-        )
-        self.data_client.initialize()
+        import wandb
+        import swanlab
+
+        cuda_alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "default")
+        logger.info(f"PYTORCH_CUDA_ALLOC_CONF: {cuda_alloc_conf}")
+
         self.data_client.reset()
 
-        self.vllm_client = VLLMClient(
-            host=self.config.vllm_server["host"],
-            server_port=self.config.vllm_server["port"],
-            nccl_port=self.config.vllm_server["nccl_port"],
+        self.nccl_client = NCCLClient(
+            host=self.config.network.vllm_host,
+            server_port=self.config.network.vllm_port,
+            nccl_port=self.config.network.nccl_port,
+            nccl_device=self.accelerator.device,
+            dp_size=self.config.vllm_server.llm_params.data_parallel_size,
         )
-        self.vllm_client.initialize_sync()
-        self.vllm_client.init_nccl_sync()
+        self.nccl_client.init_nccl()
 
-        os.makedirs(self.config.training["save_dir"], exist_ok=True)
+        os.makedirs(self.config.training.save_dir, exist_ok=True)
         swanlab.sync_wandb()
         wandb.init(
-            project=self.config.training["project_name"],
-            name=self.config.training["run_name"],
+            project=self.config.training.project_name,
+            name=self.config.training.run_name,
         )
-
-    @staticmethod
-    def _clip_listed_tensors(
-        input_1: List[torch.Tensor], input_2: List[torch.Tensor]
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        result_1 = []
-        result_2 = []
-
-        for t1, t2 in zip(input_1, input_2):
-            min_len = min(len(t1), len(t2))
-            if len(t1) != len(t2):
-                logger.error(
-                    f"Lengths of tensors are not equal: {len(t1)} != {len(t2)}"
-                )
-            result_1.append(t1[0:min_len])
-            result_2.append(t2[0:min_len])
-
-        return result_1, result_2
 
     @staticmethod
     def _sum_with_denominator(tensor_list, denominator_list):
         return sum([torch.sum(t / d) for t, d in zip(tensor_list, denominator_list)])
 
-    @track_time("gather_weights")
-    def _gather_weights(self):
-        return get_model_state_dict(
-            model=self.policy.model,
-            options=StateDictOptions(full_state_dict=True),
-        )
+    def _get_state_dict_from_parameters(self):
+        state_dict = {}
+        for name, param in self.policy.model.named_parameters():
+            name = name.replace("_checkpoint_wrapped_module.", "")
+            state_dict[name] = param.data
+            # logger.info(f"Parameter {name} with type {type(param.data)}")
+            assert isinstance(param.data, torch.Tensor), (
+                f"Parameter {name} with type {type(param.data)} is not a tensor"
+            )
+
+        return state_dict
 
     @on_main_process
-    @per_certain_step("save_steps")
+    @per_step("training.save_steps")
     @track_time("save_model")
-    def _save_model(self, state_dict: dict):
+    def _save_model(self):
         save_path = os.path.join(
-            self.config.training["save_dir"], f"step_{self.global_step}"
+            self.config.training.save_dir, f"step_{self.global_step}"
         )
         logger.info(f"Saving model {save_path} at step {self.global_step}")
 
-        unwrapped_model = self.accelerator.unwrap_model(self.policy.model)
-        unwrapped_model.save_pretrained(
-            save_path,
-            safe_serialization=True,
-            is_main_process=self.accelerator.is_main_process,
-            state_dict=state_dict,
-        )
+        state_dict = self._get_state_dict_from_parameters()
+
+        self.policy.model.save_pretrained(save_path, state_dict=state_dict)
         self.processor.processor.save_pretrained(save_path)
 
     @on_main_process
     @track_time("weight_sync")
-    def _update_vllm_weights(self, state_dict: dict):
-        self.vllm_client.update_weights_nccl_sync(state_dict)
+    def _update_vllm_weights(self):
+        state_dict = self._get_state_dict_from_parameters()
+        self.nccl_client.update_weights_nccl(state_dict)
 
-    @on_main_process
     @catch_exception
     @track_time("waiting_for_data")
     def _fetch_data(self):
-        self.data_client.update_step(self.global_step)
-        all_data = self.data_client.fetch_data(self.global_step, self.metrics)
-        save_grpo_data_to_json(
-            all_data,
-            os.path.join(
-                self.config.training["save_dir"],
-                f"data_step_{self.global_step}.json",
-            ),
+        rank_data = self.data_client.fetch_data(
+            self.global_step,
+            rank=self.accelerator.process_index,
+            update_step=True,
         )
-        global_step_grpo_data = adaptive_grouping(
-            all_data,
-            gpu_num=self.accelerator.num_processes,
-            token_budget=self.config.training["token_budget"],
-            max_micro_step_num=self.config.training.get("max_micro_step_num", 16),
-            metrics=self.metrics,
-        )
-        return global_step_grpo_data
+        reward = 0.0
+        for data in rank_data:
+            reward += sum(data.get_data_fields("reward_sum"))
+        reward /= rank_data[0].data[0].global_seq_num
+        self.metrics.add("Train/reward", reward, local_mode="sum", gather_mode="sum")
+        return rank_data
 
     @track_time("forward_pass")
     def _forward_pass(self, batch_data_per_gpu):
         inputs = self.processor.prepare_inputs(
             batch_data_per_gpu.get_data_fields("conversation"),
-            max_length=self.config.training["max_length"],
+            max_length=self.config.length.max_length,
         )
         outputs = self.policy.forward(inputs)
 
-        batched_policy_resp_logits, batched_policy_resp_input_ids = (
-            self.processor.get_batched_resp_logits_and_input_ids(inputs, outputs)
+        # Compute policy logprobs
+        batched_policy_logprobs = self.processor.get_batched_response_logprobs(
+            inputs, outputs
         )
-        batched_policy_logprobs = self.processor.get_batched_logprobs(
-            batched_policy_resp_logits, batched_policy_resp_input_ids
+        batch_data_per_gpu.set_data_fields("pol_logprobs", batched_policy_logprobs)
+
+        # Compute entropy
+        batched_per_token_entropy = self.processor.get_batched_response_entropy(
+            inputs, outputs
         )
-        batched_ref_logprobs = batch_data_per_gpu.get_data_fields("ref_logprobs")
-        batched_policy_logprobs, batched_ref_logprobs = self._clip_listed_tensors(
-            batched_policy_logprobs, batched_ref_logprobs
+        batch_data_per_gpu.set_data_fields(
+            "per_token_entropy", batched_per_token_entropy
         )
 
         # Compute KL divergence
+        batched_ref_logprobs = batch_data_per_gpu.get_data_fields("ref_logprobs")
         batched_per_token_kl = []
         for pol_lp, ref_lp in zip(batched_policy_logprobs, batched_ref_logprobs):
+            if ref_lp is None:
+                batched_per_token_kl.append(None)
+                continue
+
             per_token_kl = torch.exp(ref_lp - pol_lp) - (ref_lp - pol_lp) - 1
             per_token_kl = torch.clamp(per_token_kl, min=-10, max=10)
             batched_per_token_kl.append(per_token_kl)
 
-        # Compute entropy
-        batched_per_token_entropy = self.processor.get_batched_entropy(
-            batched_policy_resp_logits
-        )
-
-        # Set tensor fields
-        batch_data_per_gpu.set_data_fields("pol_logprobs", batched_policy_logprobs)
-        batch_data_per_gpu.set_data_fields(
-            "per_token_entropy", batched_per_token_entropy
-        )
         batch_data_per_gpu.set_data_fields("per_token_kl", batched_per_token_kl)
+
         return inputs, outputs
 
-    @track_metrics(names="loss_for_training", prefix="Train", mode="sum")
+    @track_metrics(names="loss_for_training", prefix="Train", local_mode="avg")
     def _compute_loss(self, batch_data_per_gpu):
         # Compute policy loss
         batched_per_token_loss = []
@@ -214,15 +191,18 @@ class Trainer:
             batch_data_per_gpu.get_data_fields("advantage"),
         ):
             per_token_scaled_adv = torch.exp(pol_lp - pol_lp.detach()) * adv
-            per_token_loss = -(
-                per_token_scaled_adv - self.config.training["grpo_beta"] * per_token_kl
-            )
+            if per_token_kl is not None:
+                per_token_loss = -(
+                    per_token_scaled_adv - self.config.training.grpo_beta * per_token_kl
+                )
+            else:
+                per_token_loss = -per_token_scaled_adv
             batched_per_token_loss.append(per_token_loss)
 
         batch_data_per_gpu.set_data_fields("per_token_loss", batched_per_token_loss)
 
         # Compute weights based on loss type
-        loss_type = self.config.training["loss_type"]
+        loss_type = self.config.training.loss_type
         if loss_type == "local":
             denominator_per_seq = [
                 (data.response_length * data.global_seq_num)
@@ -244,24 +224,33 @@ class Trainer:
         loss = self._sum_with_denominator(batched_per_token_loss, denominator_per_seq)
         return loss * self.accelerator.num_processes
 
-    @track_metrics(names=["loss", "kl", "entropy"], prefix="Train", mode="sum")
+    @track_metrics(names=["loss", "kl", "entropy"], prefix="Train")
     def _compute_statistics(self, batch_data_per_gpu):
         denominator_per_seq = [
             (data.response_length * data.global_seq_num)
             for data in batch_data_per_gpu.data
         ]
         loss_for_metric = self._sum_with_denominator(
-            batch_data_per_gpu.get_data_fields("per_token_loss"), denominator_per_seq
-        ) * self.accelerator.num_processes
-        kl_for_metric = self._sum_with_denominator(
-            batch_data_per_gpu.get_data_fields("per_token_kl"), denominator_per_seq
-        ) * self.accelerator.num_processes
+            batch_data_per_gpu.get_data_fields("per_token_loss"),
+            denominator_per_seq,
+        )
+        batched_per_token_kl = batch_data_per_gpu.get_data_fields("per_token_kl")
+        all_has_ref_lp = all(kl is not None for kl in batched_per_token_kl)
+        if all_has_ref_lp:
+            kl_for_metric = self._sum_with_denominator(
+                batched_per_token_kl, denominator_per_seq
+            )
+        else:
+            kl_for_metric = 0
+
         entropy_for_metric = self._sum_with_denominator(
-            batch_data_per_gpu.get_data_fields("per_token_entropy"), denominator_per_seq
-        ) * self.accelerator.num_processes
+            batch_data_per_gpu.get_data_fields("per_token_entropy"),
+            denominator_per_seq,
+        )
         return loss_for_metric, kl_for_metric, entropy_for_metric
 
     @track_time("backward_pass")
+    @track_memory("backward_pass")
     def _backward_pass(self, loss):
         self.accelerator.backward(loss)
 
@@ -270,7 +259,7 @@ class Trainer:
     def _grad_clip(self):
         return torch.nn.utils.clip_grad_norm_(
             self.policy.model.parameters(),
-            max_norm=self.config.training["max_grad_norm"],
+            max_norm=self.config.training.max_grad_norm,
         )
 
     @track_time("optimizer_step")
@@ -292,44 +281,33 @@ class Trainer:
     def train_step(self):
         self.optimizer.zero_grad()
 
-        state_dict = self._gather_weights()
-        self._save_model(state_dict)
-        self._update_vllm_weights(state_dict)
-        del state_dict
-
-        global_step_grpo_data = self._fetch_data()
-        global_step_grpo_data = broadcast_object_list(
-            [global_step_grpo_data], from_process=0
-        )[0]
-        if global_step_grpo_data is None or global_step_grpo_data.is_empty:
-            logger.info(
-                f"No data for global step {self.global_step} which type is {type(global_step_grpo_data)}"
-            )
-            return
-
-        for micro_batch_data in global_step_grpo_data.data:
-            batch_data_per_gpu = micro_batch_data.data[self.accelerator.process_index]
-            self._process_micro_batch(batch_data_per_gpu)
-
+        rank_data = self._fetch_data()
+        for batch in rank_data:
+            self._process_micro_batch(batch)
         self._grad_clip()
         self._optimizer_step()
+
+        self._update_vllm_weights()
+        self._save_model()
 
     def train(self):
         self.accelerator.wait_for_everyone()
 
-        for self.global_step in range(self.config.training["total_steps"]):
+        for self.global_step in range(self.config.training.total_steps):
             self.train_step()
 
     @on_main_process
     def cleanup(self):
-        self.vllm_client.close_sync()
+        import wandb
+
+        self.nccl_client.close()
         self.data_client.close()
         wandb.finish()
-        swanlab.finish()
 
 
 def main():
-    trainer = Trainer(sys.argv[1])
+    config = ConfigManager(sys.argv[1])
+    trainer = Trainer(config)
     trainer.train()
     trainer.cleanup()
 

@@ -1,72 +1,42 @@
 import logging
-import torch
 from typing import List, Optional, Dict, Any
 
+import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from data_service.typing.message import Conversation
-from implement.model.basic import TFBasicModelMixin, TFBasicProcessorMixin
+from implement.model.utils import TFBasicModelMixin, TFBasicProcessorMixin
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
 class TFModelImpl(TFBasicModelMixin):
-    multimodal = False
-
-    def __init__(self, model_name_or_path: str):
-        logger.info(f"Loading model: {model_name_or_path}")
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name_or_path,
-            device_map="cuda",
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
+    def __init__(self, init_params: Dict[str, Any]):
+        init_params.update(
+            {
+                "torch_dtype": torch.bfloat16,
+                "attn_implementation": "flash_attention_2",
+            }
         )
+        self.model = AutoModelForCausalLM.from_pretrained(**init_params)
 
 
 class TFProcessorImpl(TFBasicProcessorMixin):
     multimodal = False
 
-    def __init__(self, model_name_or_path: str):
-        self.processor = AutoTokenizer.from_pretrained(
-            model_name_or_path,
-            padding_side="left",
-            use_fast=False,
-        )
+    def __init__(self, init_params: Dict[str, Any]):
+        init_params.update({"padding_side": "left", "use_fast": False})
+        self.processor = AutoTokenizer.from_pretrained(**init_params)
         self.prefix_ids = self.get_prefix_ids()
-
-    def get_seq_length(self, conversation: Conversation) -> int:
-        if conversation.get_last_role() == "assistant":
-            text = self.processor.apply_chat_template(
-                conversation.model_dump()["messages"],
-                tokenize=False,
-                add_generation_prompt=False,
-                continue_final_message=True,
-            )
-        elif conversation.get_last_role() == "user":
-            text = self.processor.apply_chat_template(
-                conversation.model_dump()["messages"],
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-
-        token_ids = self.processor.tokenize(text)
-        return len(token_ids)
 
     def prepare_inputs(
         self, conversations: List[Conversation], max_length: Optional[int] = None
     ) -> Dict[str, Any]:
         texts = [
-            self.processor.apply_chat_template(
-                conversation.model_dump()["messages"],
-                tokenize=False,
-                add_generation_prompt=False,
-                continue_final_message=True,
-            )
-            for conversation in conversations
+            self.conversation_to_text(conversation) for conversation in conversations
         ]
 
-        # Prepare model inputs
         inputs = self.processor(
             text=texts,
             return_tensors="pt",
@@ -76,3 +46,7 @@ class TFProcessorImpl(TFBasicProcessorMixin):
         ).to("cuda")
 
         return inputs
+
+    def conversation_to_token_ids(self, conversation: Conversation) -> List[int]:
+        text = self.conversation_to_text(conversation)
+        return self.processor(text)["input_ids"]

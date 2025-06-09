@@ -1,0 +1,22 @@
+[project]
+name = "mygo"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "accelerate>=1.7.0",
+    "datasets>=3.6.0",
+    "torch==2.7.0",
+    "vllm==0.9.0.1",
+    "flash-attn>=2.7.4.post1",
+    "flashinfer-python>=0.2.6.post1",
+    "fire>=0.7.0",
+    "tenacity>=9.1.2",
+    "wandb>=0.20.1",
+    "swanlab>=0.6.1",
+]
+
+[[tool.uv.index]]
+url = "https://mirrors.ustc.edu.cn/pypi/simple"
+default = true

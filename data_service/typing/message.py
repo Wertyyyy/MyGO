@@ -99,6 +99,45 @@ class Conversation(BaseModel):
     class Config:
         validate_assignment = True
 
+    @field_validator("messages", mode="after")
+    @classmethod
+    def validate_messages(cls, value):
+        """
+        Validate that the first message is 'system', and then 'user' and 'assistant' alternate.
+        """
+        messages = (
+            value.get("messages")
+            if isinstance(value, dict)
+            else getattr(value, "messages", None)
+        )
+        if messages is None:
+            return value
+
+        if not messages:
+            return value
+
+        # Check first message is 'system'
+        first_role = (
+            messages[0].role
+            if hasattr(messages[0], "role")
+            else messages[0].get("role")
+        )
+        if first_role != "system":
+            raise ValueError(
+                "The first message in a Conversation must have role 'system'."
+            )
+
+        # Check alternation: user, assistant, user, assistant, ...
+        expected_roles = ["user", "assistant"]
+        for idx, msg in enumerate(messages[1:], start=1):
+            role = msg.role if hasattr(msg, "role") else msg.get("role")
+            expected_role = expected_roles[(idx - 1) % 2]
+            if role != expected_role:
+                raise ValueError(
+                    f"Message at position {idx} must have role '{expected_role}', got '{role}'."
+                )
+        return value
+
     def add_message(
         self,
         role: Literal["system", "user", "assistant"],
@@ -111,6 +150,24 @@ class Conversation(BaseModel):
 
     def get_images(self) -> List[Image.Image]:
         return [image for message in self.messages for image in message.get_images()]
+
+    def pprint(self):
+        for idx, message in enumerate(self.messages):
+            role = getattr(message, "role", None)
+            content = getattr(message, "content", None)
+            if isinstance(content, dict) and "image" in content:
+                image_data = content["image"]
+                if isinstance(image_data, str) and image_data.startswith("data:image/"):
+                    short_base64 = image_data[:50] + (
+                        "..." if len(image_data) > 50 else ""
+                    )
+                    logger.info(f"[{idx}] {role}: <image: {short_base64}>")
+                else:
+                    logger.info(f"[{idx}] {role}: <image: {type(image_data)}>")
+            elif isinstance(content, str):
+                logger.info(f"[{idx}] {role}: {content}")
+            else:
+                logger.info(f"[{idx}] {role}: {content}")
 
 
 def encode_image_to_base64(image_or_path: Union[str, Image.Image]) -> str:

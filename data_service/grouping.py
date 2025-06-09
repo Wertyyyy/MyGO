@@ -5,7 +5,7 @@ from data_service.typing.grpo_data import GRPOData, GlobalStepGRPOData
 from utils.metrics import MetricsManager
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 def adaptive_grouping(
@@ -31,14 +31,14 @@ def adaptive_grouping(
             logger.debug(
                 f"Discarding data that exceeds token budget: prompt_idx={discarded.prompt_idx}, response_idx={discarded.response_idx}, length={discarded.length}/{discarded.prompt_length}/{discarded.response_length}"
                 f"conversation={discarded.conversation}, "
-                f"token_ids={discarded.token_ids}"
+                f"token_ids={discarded.resp_token_ids}"
             )
         elif flatten_data[0].response_length == 0:
             discarded = flatten_data.pop(0)
             logger.debug(
                 f"Discarding data that has no response: prompt_idx={discarded.prompt_idx}, response_idx={discarded.response_idx}, length={discarded.length}/{discarded.prompt_length}/{discarded.response_length}, "
                 f"conversation={discarded.conversation}, "
-                f"token_ids={discarded.token_ids}"
+                f"token_ids={discarded.resp_token_ids}"
             )
         else:
             filtered_data.append(flatten_data.pop(0))

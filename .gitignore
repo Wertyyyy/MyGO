@@ -9,3 +9,9 @@ wandb/
 
 # IDE
 .vscode/
+
+# Python virtual environment
+.venv/
+
+# Notes
+notes.md

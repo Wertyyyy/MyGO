@@ -2,11 +2,10 @@ import logging
 import time
 import asyncio
 import uuid
-from typing import List, Any
+from typing import List
 import contextlib
 import importlib.util
 import socket
-import os
 import traceback
 
 import torch
@@ -16,6 +15,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 
 from data_service.typing.message import Conversation
+from config.utils import ConfigManager
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -27,36 +27,36 @@ class InferenceRequest(BaseModel):
 
 class InferenceResponse(BaseModel):
     batched_logprobs: List[List[float]]
-    batched_input_ids: List[List[int]]
 
 
 class TransformersServer:
     def __init__(
         self,
-        impl_path: str,
-        model_params: dict[str, Any],
-        processor_params: dict[str, Any],
-        token_budget: int,
-        max_length: int,
+        config: ConfigManager,
     ):
+        self.config = config
+        self.max_length = self.config.length.max_length
+
         # Load model and processor implementations
-        impl_module = importlib.import_module(impl_path)
+        impl_module = importlib.import_module(self.config.model.impl_path)
 
         # Initialize model
-        self.model = impl_module.TFModelImpl(**model_params)
+        init_params = self.config.model.init_params.to_dict()
+        init_params["device_map"] = self.config.tf_server.device
+        self.model = impl_module.TFModelImpl(init_params=init_params)
 
         # Initialize processor
-        self.processor = impl_module.TFProcessorImpl(**processor_params)
+        self.processor = impl_module.TFProcessorImpl(
+            init_params=self.config.processor.init_params.to_dict()
+        )
 
-        self.max_length = max_length
-        self.token_budget = token_budget
         self.pending_requests = []
         self.request_lock = asyncio.Lock()
         self.results = {}
         self.processing_task = None
 
-        logger.info(f"Loaded model from: {model_params['model_name_or_path']}")
-        logger.info(f"Multimodal: {self.model.multimodal}")
+        logger.info(f"Loaded model implementation: {self.config.model.impl_path}")
+        logger.info(f"Multimodal: {self.processor.multimodal}")
         logger.info(f"Prefix IDs: {self.processor.prefix_ids}")
 
     async def start_processing_loop(self):
@@ -101,7 +101,7 @@ class TransformersServer:
                 new_token_usage = new_max_seq_len * (len(batch) + 1)
 
                 # Check if adding this item would exceed token budget
-                if new_token_usage <= self.token_budget:
+                if new_token_usage <= self.config.training.token_budget:
                     # Add the item to our batch
                     batch.append(req["conversation"])
                     batch_ids.append(req["request_id"])
@@ -114,7 +114,8 @@ class TransformersServer:
                 self.pending_requests.pop(i)
 
         logger.info(
-            f"Created batch with {len(batch)} items, token usage: {current_token_usage}/{self.token_budget}"
+            f"Created batch with {len(batch)} items, token usage: "
+            f"{current_token_usage}/{self.config.training.token_budget}"
         )
         return batch, batch_ids
 
@@ -127,31 +128,14 @@ class TransformersServer:
 
                 # Get logprobs from model
                 outputs = self.model.forward(inputs)
-                batched_resp_logits, batched_input_ids = (
-                    self.processor.get_batched_resp_logits_and_input_ids(
-                        inputs, outputs
-                    )
+                batched_ref_logprobs = self.processor.get_batched_response_logprobs(
+                    inputs, outputs
                 )
-                logprobs_tensors = self.processor.get_batched_logprobs(
-                    batched_resp_logits, batched_input_ids
-                )
-
-                # Convert tensors to lists of floats
-                results = []
-                for logprob_tensor, input_ids in zip(
-                    logprobs_tensors, batched_input_ids
-                ):
-                    results.append(
-                        {
-                            "logprobs": logprob_tensor.cpu().tolist(),
-                            "input_ids": input_ids.cpu().tolist(),
-                        }
-                    )
 
                 logger.info(
-                    f"Processed batch of {len(batch)} conversations, returned {len(results)} results"
+                    f"Processed batch of {len(batch)} conversations, returned {len(batched_ref_logprobs)} results"
                 )
-                return results
+                return batched_ref_logprobs
 
         except Exception as e:
             tb_str = traceback.format_exc()
@@ -240,10 +224,7 @@ def create_app(server: TransformersServer):
         if results is None:
             raise Exception("Timeout waiting for inference results")
 
-        return InferenceResponse(
-            batched_logprobs=[result["logprobs"] for result in results],
-            batched_input_ids=[result["input_ids"] for result in results],
-        )
+        return InferenceResponse(batched_logprobs=results)
 
     return app
 
@@ -253,45 +234,18 @@ def main(config_file: str):
     local_ip = socket.gethostbyname(hostname)
     logger.info(f"Local IP address: {local_ip}")
 
-    # Load the Python config module
-    spec = importlib.util.spec_from_file_location("config_module", config_file)
-    config_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(config_module)
-
-    tf_config = config_module.tf_server
-    model_config = config_module.model
-    processor_config = config_module.processor
-
-    # Handle GPU configuration
-    gpu_id = tf_config["gpu_id"]
-    if gpu_id >= 0:
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-        logging.info(f"Using GPU {gpu_id}")
-    elif gpu_id < 0 and gpu_id >= -torch.cuda.device_count():
-        total_gpu_nums = torch.cuda.device_count()
-        logging.info(f"Total GPUs: {total_gpu_nums}")
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id + total_gpu_nums)
-        logging.info(f"Using GPU {gpu_id + total_gpu_nums}")
-    else:
-        raise ValueError(f"Invalid GPU ID: {gpu_id}")
-
     # Create server
-    server = TransformersServer(
-        impl_path=model_config["impl_path"],
-        model_params=model_config["params"],
-        processor_params=processor_config["params"],
-        token_budget=tf_config["token_budget"],
-        max_length=tf_config["max_length"],
-    )
+    config = ConfigManager(config_file)
+    server = TransformersServer(config=config)
 
     app = create_app(server)
-    config = uvicorn.Config(
+    uvicorn_config = uvicorn.Config(
         app,
-        host=tf_config["host"],
-        port=tf_config["port"],
+        host="0.0.0.0",
+        port=config.network.tf_port,
         timeout_keep_alive=7200,
     )
-    server_instance = uvicorn.Server(config)
+    server_instance = uvicorn.Server(uvicorn_config)
     asyncio.run(server_instance.serve())
 
 

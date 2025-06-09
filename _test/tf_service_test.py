@@ -3,9 +3,9 @@ import time
 import logging
 import importlib
 import fire
-import importlib.util
 
 from tf_service.tf_client import TFClient
+from config.utils import ConfigManager
 from _test.test_data.convs import (
     TEST_CONVERSATIONS_MULTIMODAL,
     TEST_CONVERSATIONS_PURE_TEXT,
@@ -15,12 +15,15 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def check_multimodal_support(config_module):
+def check_multimodal_support(config: ConfigManager):
     """Check if the model implementation supports multimodal"""
     try:
-        tf_config = config_module.tf_server
-        impl_module = importlib.import_module(tf_config["impl_path"])
-        return impl_module.TFModelImpl.multimodal
+        impl_module = importlib.import_module(config.model.impl_path)
+        # Create a temporary processor to check multimodal support
+        processor = impl_module.TFProcessorImpl(
+            init_params=config.processor.init_params.to_dict()
+        )
+        return processor.multimodal
     except Exception as e:
         logger.warning(f"Could not check multimodal support: {e}")
         return False
@@ -41,12 +44,9 @@ async def test_inference(client: TFClient, test_conversations):
                 and len(results["batched_logprobs"]) > 0
             ):
                 logprobs = results["batched_logprobs"][0]
-                token_ids = results["batched_input_ids"][0]
 
                 logger.info(f"  Logprobs count: {len(logprobs)}")
                 logger.info(f"  Logprobs: {logprobs}")
-                logger.info(f"  Token IDs count: {len(token_ids)}")
-                logger.info(f"  Token IDs: {token_ids}")
             else:
                 logger.error(f"  Testing {test_name} failed: no results returned")
 
@@ -72,13 +72,11 @@ async def test_large_batch_inference(client: TFClient, test_conversations):
 
         if results and "batched_logprobs" in results:
             batched_logprobs = results["batched_logprobs"]
-            batched_input_ids = results["batched_input_ids"]
 
             logger.info(
                 f"Large batch inference completed in {end_time - start_time:.2f} seconds"
             )
             logger.info(f"Returned {len(batched_logprobs)} results")
-            logger.info(f"Returned {len(batched_input_ids)} results")
             logger.info(
                 f"Average time per message: {(end_time - start_time) / len(large_batch):.3f} seconds"
             )
@@ -93,13 +91,11 @@ async def test_tf_service(config_path: str):
     """Test TF Service"""
     logger.info("Starting TF Service tests")
 
-    # Load the Python config module
-    spec = importlib.util.spec_from_file_location("config_module", config_path)
-    config_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(config_module)
+    # Use ConfigManager instead of directly loading config module
+    config = ConfigManager(config_path)
 
     # Check multimodal support
-    is_multimodal = check_multimodal_support(config_module)
+    is_multimodal = check_multimodal_support(config)
     logger.info(f"Model multimodal support: {is_multimodal}")
 
     # Select appropriate test conversations
@@ -110,9 +106,8 @@ async def test_tf_service(config_path: str):
         test_conversations = TEST_CONVERSATIONS_PURE_TEXT
         logger.info("Using text-only test conversations")
 
-    tf_config = config_module.tf_server
-    host = tf_config["host"]
-    port = tf_config["port"]
+    host = "0.0.0.0"
+    port = config.network.tf_port
 
     logger.info(f"Connecting to TF service at {host}:{port}")
 

@@ -1,9 +1,7 @@
 import time
 import json
 
-from data_service.data_client import DataClient, data_statistics
-from data_service.grouping import adaptive_grouping
-from utils.metrics import MetricsManager
+from data_service.data_client import DataClient
 
 
 def main():
@@ -30,29 +28,26 @@ def main():
 
             # Fetch training data
             try:
-                metrics = MetricsManager(auto_log=False)
                 print(f"  → Fetching data for step {step}")
                 start_time = time.time()
-                data = data_client.fetch_data(step, metrics)
-                total_samples = sum(len(batch) for batch in data)
-                end_time = time.time()
-                print(
-                    f"  ✓ Fetched {len(data)} batches with {total_samples} samples in {end_time - start_time:.2f} seconds"
+                rank_data = data_client.fetch_data(
+                    step, rank=0, update_step=False
                 )
-                with open(f"step_{step}_list.json", "w") as f:
-                    json.dump(
-                        [[item.model_dump() for item in batch] for batch in data],
-                        f,
-                        indent=4,
-                    )
-                data_statistics(data, metrics)
-                grouped_data = adaptive_grouping(data, 7, 7000, 2, metrics)
-                with open(f"step_{step}_grouped.json", "w") as f:
-                    json.dump(grouped_data.model_dump(), f, indent=4)
-                # grouped_data.log()
-                metrics.gather_and_log(step=step)
+                end_time = time.time()
+                print(f"  ✓ Finished in {end_time - start_time:.2f} seconds")
+                print(f"  ✓ Fetched {len(rank_data)} micro steps")
+                print(f"  ✓ Fetched {len(rank_data[0].data)} batches")
+                # with open(f"step_{step}_list.json", "w") as f:
+                #     json.dump(
+                #         [[item.model_dump() for item in batch] for batch in data.data],
+                #         f,
+                #         indent=4,
+                #     )
+                # with open(f"step_{step}_grouped.json", "w") as f:
+                #     json.dump(data.model_dump(), f, indent=4)
             except Exception as e:
                 print(f"  ✗ Error fetching data: {e}")
+                raise e
         else:
             print(f"  ✗ Failed to update to step {step}")
 

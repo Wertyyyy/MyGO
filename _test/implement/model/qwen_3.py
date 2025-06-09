@@ -45,6 +45,13 @@ def test(config_file: str):
             f"\nUsing text-only conversations ({len(test_conversations)} cases)"
         )
 
+    # Add <think></think> prefix to all assistant responses for Qwen3
+    logger.info("Adding prefix to assistant responses for Qwen3 testing")
+    for name, conversation in test_conversations.items():
+        for message in conversation.messages:
+            if message.role == "assistant":
+                message.content = "<think>\n\n</think>\n\n" + message.content
+
     # Test different batch sizes
     for name, conversation in test_conversations.items():
         logger.info(f"Testing {name}")

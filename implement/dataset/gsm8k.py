@@ -5,35 +5,30 @@ from typing import Optional
 from datasets import Dataset
 
 from data_service.typing.message import Conversation
+from implement.dataset.utils import load_prompt
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class DatasetImpl:
-    def __init__(self, dataset_path: str, system_prompt_path: Optional[str] = None, prompt_template_path: Optional[str] = None):
-        """
-        Initialize GSM8K dataset loader.
-
-        Args:
-            dataset_path: Path to the JSONL file
-            system_prompt_path: Path to the system prompt file
-        """
+class TrainingDatasetImpl:
+    def __init__(
+        self,
+        dataset_path: str,
+        system_prompt_path: Optional[str] = None,
+        template_path: Optional[str] = None,
+    ):
         self.dataset = self._load_dataset(dataset_path)
-        if system_prompt_path is not None:
-            with open(system_prompt_path, "r", encoding="utf-8") as f:
-                self.system_prompt = f.read()
-                logger.info(f"Loaded system prompt {repr(self.system_prompt)}")
-        else:
-            self.system_prompt = None
-        if prompt_template_path is not None:
-            with open(prompt_template_path, "r", encoding="utf-8") as f:
-                self.prompt_template = f.read()
-                logger.info(f"Loaded prompt template {repr(self.prompt_template)}")
-        else:
-            self.prompt_template = None
 
-    def _load_dataset(self, dataset_path: str):
+        self.system_prompt = (
+            load_prompt(system_prompt_path) if system_prompt_path is not None else None
+        )
+        self.prompt_template = (
+            load_prompt(template_path) if template_path is not None else None
+        )
+
+    @staticmethod
+    def _load_dataset(dataset_path: str):
         """Load dataset from local JSONL file"""
         logger.info(f"Loading local JSONL file: {dataset_path}")
         data = []
@@ -45,16 +40,6 @@ class DatasetImpl:
         return Dataset.from_list(data)
 
     def collate_fn(self, examples):
-        """
-        Collate function to process a batch of examples.
-
-        Args:
-            examples: List of examples from the dataset
-
-        Returns:
-            conversations: List of conversation structures
-            solutions: List of answer strings
-        """
         conversations = []
         solutions = []
 
@@ -67,31 +52,27 @@ class DatasetImpl:
             else:
                 prompt = question
 
-            # Create conversation structure
+            message_list = [
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ]
+
             if self.system_prompt is not None:
-                conversation = Conversation(
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": self.system_prompt,
-                        },
-                        {
-                            "role": "user",
-                            "content": prompt,
-                        },
-                    ]
-                )
-            else:
-                conversation = Conversation(
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": prompt,
-                        },
-                    ]
+                message_list.insert(
+                    0,
+                    {
+                        "role": "system",
+                        "content": self.system_prompt,
+                    },
                 )
 
+            conversation = Conversation(messages=message_list)
             conversations.append(conversation)
             solutions.append(answer)
 
         return conversations, solutions
+
+
+TestDatasetImpl = TrainingDatasetImpl
